@@ -180,6 +180,27 @@ def predict_logits(
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Collects a classifier's logits and the true targets for a whole dataset.
+
+    Runs the model over every batch in the loader without tracking gradients
+    and gathers the results into tensors, so they can be analyzed
+    together.
+    This does not switch the model to evaluation mode. Call `model.eval()`
+    first, or layers like batch norm will behave as they do in training.
+
+    Args:
+        model (Module): The classifier to run. It should map a batch of images to a
+            tensor of class logits with shape (batch, num_classes).
+        loader (DataLoader[tuple[Tensor, Tensor]]): A DataLoader yielding (images, targets) batches. It should not
+            shuffle if you need the results in the dataset's original order.
+        device (device): The device to run the model on. It must match the model's
+            device.
+
+    Returns:
+        A tuple of (logits, targets) on the CPU, with shapes
+        (num_samples, num_classes) and (num_samples,).
+    """
     all_logits, all_targets = [], []
     for images, targets in loader:
         all_logits.append(model(images.to(device)).cpu())
@@ -188,6 +209,14 @@ def predict_logits(
 
 
 def generate_id_map(path: str | Path) -> dict[int, str]:
+    """
+    Parses the HWRT symbols.csv file and generates a dictionary from
+    symbol ids to their real strings.
+    Args:
+        path (str | Path): Path to an HWRT symbols.csv (semicolon-delimited, single-quoted).
+    Returns:
+        A dictionary of type dict[int, str] that maps symbol ids to the coresponding strings.
+    """
     symbol_id_map = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f, delimiter=";", quotechar="'"):
@@ -201,6 +230,14 @@ def generate_id_map(path: str | Path) -> dict[int, str]:
 
 
 def load(path: str | Path) -> Iterator[tuple[int, str, Strokes]]:
+    """
+    Lazily parses a HWRT CSV file one line at a time. The whole file is never held in memory.
+    Args:
+        path (str | Path): Path to an HWRT data CSV (semicolon-delimited, single-quoted).
+    Yields:
+        A tuple of (symbol_id, user_id, strokes) for each row, where strokes
+        is the parsed list of strokes for one symbol.
+    """
     with open(path, newline="") as f:
         for row in csv.DictReader(f, delimiter=";", quotechar="'"):
             yield (
@@ -211,15 +248,27 @@ def load(path: str | Path) -> Iterator[tuple[int, str, Strokes]]:
 
 
 def normalize(strokes: Strokes) -> NormalizedStrokes:
-    # Since the raw X and Y of the data is likely irrelevant to what the actual character is, normalizing it will
-    # make it so the NN won't have to figure that out by itself.
-    #
-    # Strokes is a list of 1+ strokes, and represents one character.
-    # A single character can have multiple strokes if you need to lift your pen when writing it,
-    # for example i, j, or t.
-    #
-    # Each stroke is a list of (x,y,t) points, which are represented with dicitonaries.
+    """
+    Centers and scales a symbol so its shape is independent of position and size.
+    This process may be changed or removed in the future to help determine differences
+    between similar shaped classes.
 
+    Shifts the symbol so the center of its bounding box is at the origin, then
+    divides by the length of the box's longer side. Both axes use the same
+    scale, so the aspect ratio is preserved. Timestamps are ignored.
+
+    Args:
+        strokes (Strokes): One symbol as a list of strokes, where each stroke is a list
+            of points with "x" and "y" keys. A symbol has several strokes when
+            the pen is lifted, like with letters 'i', 'j', or 't'
+
+    Returns:
+        One array of shape (n_points, 2) per stroke, with coordinates between
+        -0.5 and 0.5.
+
+    Raises:
+        ValueError: If the symbol contains no points.
+    """
     # Takes every point from every stroke in strokes and puts them in a single array
     points = np.array(
         [[point["x"], point["y"]] for stroke in strokes for point in stroke], float
@@ -243,6 +292,19 @@ def normalize(strokes: Strokes) -> NormalizedStrokes:
 def render(
     strokes: NormalizedStrokes, size: int = 32, pad: int = 2, width: int = 2
 ) -> NDArray[np.float32]:
+    """
+    Renders normalized strokes as a grayscale image.
+
+    Args:
+        strokes (NormalizedStrokes): The strokes to draw, as returned by `normalize`. Each array
+            has shape (n_points, 2), with coordinates between -0.5 and 0.5.
+        size (int): The width and height of the output image, in pixels.
+        pad (int): The empty margin around the drawing, in pixels.
+        width (int): The line width, in pixels.
+
+    Returns:
+        A (size, size) array of pixel intensities from 0.0 (black) to 1.0 (white).
+    """
     img = Image.new("L", (size, size), 0)
     d, s = ImageDraw.Draw(img), size - 2 * pad
     for st in strokes:
@@ -255,17 +317,49 @@ def render(
 
 
 def count_rows(path: str | Path) -> int:
+    """
+    A helper function to count the number of rows in the given file.
+    Args:
+        path (str|Path): The file to count the rows of
+    """
     with open(path, newline="") as f:
         return sum(1 for _ in f) - 1  # minus the header line
 
 
 def read_raw_rows(path: str | Path) -> Iterator[RawRow]:
+    """
+    Reads the rows of an HWRT CSV file without parsing the stroke data.
+    This is a generator, so rows are read from the file one at a time.
+    The stroke column is left as the raw YAML text, since parsing it is the
+    slow part and is done later.
+
+    Args:
+        path (str|Path): Path to an HWRT CSV file, such as train-data.csv. The file must
+            use ";" as the delimiter and "'" as the quote character.
+
+    Yields:
+        A tuple of (symbol_id, user_id, raw_data), where raw_data is the
+        unparsed YAML string holding the strokes.
+    """
     with open(path, newline="") as f:
         for row in csv.DictReader(f, delimiter=";", quotechar="'"):
             yield int(row["symbol_id"]), row["user_id"], row["data"]
 
 
 def process_row(row: RawRow) -> Result | None:
+    """
+    Converts one raw CSV row into a rendered image for the cache.
+    Parses the row's YAML stroke data, normalizes it, and renders it to a
+    small grayscale image.
+
+    Args:
+        row (RawRow): A (symbol_id, user_id, raw_yaml) tuple, where raw_yaml is the
+            unparsed stroke data string from the CSV.
+
+    Returns:
+        A (symbol_id, user_id, image) tuple, or None if the row has no
+        strokes or only empty ones.
+    """
     symbol_id, user_id, raw = row
     strokes = [s for s in yaml.load(raw, Loader=LOADER) if s]
     if not strokes:
@@ -274,6 +368,17 @@ def process_row(row: RawRow) -> Result | None:
 
 
 def build_cache(csv_path: str, out_path: str) -> None:
+    """
+    Converts an HWRT CSV file into a cache of rendered images.
+    Parses each sample's strokes, normalizes and renders them to an image,
+    and saves the results as a compressed NumPy archive so later runs can skip
+    the slow YAML parsing.
+    Args:
+        csv_path: Path to an HWRT CSV file (such as train-data.csv).
+        out_path: Where to write the .npz archive. It contains three arrays in
+            matching order: `images` (float32, shape (N, 32, 32)), `labels`
+            (int64 symbol IDs) and `users` (string user IDs).
+    """
     print("caching", csv_path)
     images: list[NDArray[np.float32]] = []
     labels: list[int] = []
@@ -306,6 +411,20 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
 ) -> tuple[float, float]:
+    """
+    Trains the model for one Epoch on the given data.
+    Args:
+        model (Module): The classifier to train. It should map a batch of images to a
+            tensor of class logits with shape (batch, num_classes).
+        loader: A DataLoader yielding (images, targets) batches, where targets
+            holds integer class indices with shape (batch,).
+        optimizer: The optimizer that updates the model's parameters.
+        device: The device to run on. Each batch is moved here before being
+            passed to the model, which must already be on the same device.
+
+    Returns:
+        A tuple of (mean cross-entropy loss, accuracy as a fraction from 0 to 1).
+    """
     model.train()
     total_loss = 0.0
     correct = 0
@@ -333,6 +452,25 @@ def evaluate(
     loader: DataLoader[tuple[torch.Tensor, torch.Tensor]],
     device: torch.device,
 ) -> tuple[float, float]:
+    """
+    Measures a classifier's loss and accuracy on a dataset.
+
+    Puts the model in evaluation mode and runs it over every batch in the
+    loader without tracking gradients, so no weights are updated. This leaves the
+    model in evaluation mode. model.train() must be called before training again.
+
+    Args:
+        model (Module): The classifier to evaluate. It should map a batch of images to
+            a tensor of logits with shape (batch, num_classes).
+        loader (DataLoader[tuple[torch.Tensor, torch.Tensor]]): A DataLoader
+            yielding (images, targets) batches
+        device (device): The device to run on. Each batch is moved here before being
+            passed to the model, which must already be on the same device.
+
+    Returns:
+        A tuple (loss, accuracy). The loss is the mean cross-entropy over all
+        samples, and the accuracy is the fraction of samples that match the target.
+    """
     model.eval()
     total_loss = 0.0
     correct = 0
@@ -351,6 +489,18 @@ def evaluate(
 def alnum_accuracy(
     logits: torch.Tensor, targets: torch.Tensor, class_ids, symbol_id_map
 ) -> None:
+    """
+    Displays accuracy for latin letters or digits.
+
+    Accuracy is reported two ways: unrestricted, where the model may predict
+    any class, and restricted, where only letter and digit classes are allowed
+    as predictions (as though only those symbols enabled).
+
+    Args:
+        logits (Tensor): Raw model scores over the validation set.
+        targets (Tensor): True class indices using the same
+            indexing as the columns of `logits`.
+    """
     # Classes whose LaTeX name is a single letter or digit
     is_alnum = torch.tensor(
         [
@@ -391,7 +541,16 @@ def show(
     images: NDArray[np.float32],
     symbol_id_map: dict[int, str],
     labels: NDArray[np.int64] | None = None,
+    out_path: str | Path = "samples.png",
 ) -> None:
+    """
+    Draw the given images and save them to a file
+    Args:
+        images (NDArray[np.float32]): The array of images to be rendered (3-dimensional)
+        symbol_id_map (dict[int, str]): A dictionary that maps symbol ids to their actual string
+        labels: (NDArray[np.int64] | None): A list of labels for the images
+        out_path: (str | Path): Path to save the image to, "samples.png" if none
+    """
     figure, axes = plt.subplots(
         1, len(images), figsize=(2 * len(images), 2), squeeze=False
     )
@@ -400,15 +559,24 @@ def show(
         ax.set_title(symbol_id_map[int(labels[i])] if labels is not None else "")
         ax.axis("off")
 
-    figure.savefig("samples.png", dpi=150)
+    figure.savefig(out_path, dpi=150)
     plt.close(figure)
 
 
-def summarize(name: str, labels: NDArray[np.int64], users: NDArray[np.str_]) -> None:
-    counts = Counter(labels.tolist())
+def summarize(
+    name: str, symbol_ids: NDArray[np.int64], users: NDArray[np.str_]
+) -> None:
+    """
+    Gives helpful statistics for the given dataset, calling out classes with a low number of samples
+    Args:
+        name (str): The name of the dataset
+        symbol_ids (NDArray[np.int64]): The array of symbol_ids from the dataset
+        users (NDArray[np.str_]): The array of user_ids from the dataset
+    """
+    counts = Counter(symbol_ids.tolist())
     per_class = np.array(list(counts.values()))
     print(f"--- {name} ---")
-    print(f"samples: {len(labels)}")
+    print(f"samples: {len(symbol_ids)}")
     print(f"classes: {len(counts)}")
     print(
         f"samples per class: min {per_class.min()}, "
