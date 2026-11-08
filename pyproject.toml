@@ -1,0 +1,24 @@
+[project]
+name = "fingernib-training"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Kyle Holtz", email = "keholtz08@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.4",
+    "pillow>=13.0.0",
+    "pyyaml>=6.0.3",
+    "torch>=2.15.0",
+    "tqdm>=4.70.1",
+]
+
+[project.scripts]
+fingernib-training = "fingernib_training:main"
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
